@@ -4636,7 +4636,7 @@ def locus(args):
                 if vartype == 'SNV':
                     ax1.plot(start,ypos, marker= 'v',fillstyle='full', mec='black', mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
                 if vartype == 'INS':
-                    ax1.plot(start,ypos, marker= 'P',fillstyle='full', mec='black', mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
+                    ax1.plot(start,ypos, marker= 'P',fillstyle='full', mec=color, mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
                 if vartype == 'DEL':
                      ax1.plot(start,ypos, marker= '|',fillstyle='full', mec=color, mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
                      ax1.add_line(matplotlib.lines.Line2D([start, (start+length)], [ypos, ypos], lw=lw, zorder=4, color=color, alpha=1))
@@ -4756,8 +4756,62 @@ def locus(args):
         ax0.set_xticklabels(xt_labels, rotation=45)
     else:
         ax0.set_xticklabels(xt_labels)
+        # deletion spans in mod-space (for breaking lines)
+    del_spans_cpg = []
+
+    if args.splitvar and args.variants and len(variants) > 0:
+        orig_locs = sorted(set(meth_table['orig_loc']))
+
+        if len(orig_locs) > 0:
+            for vpos, (vref, valt, vtype, vlen) in variants.items():
+                if vtype != 'DEL':
+                    continue
+                if vlen is None:
+                    continue
+
+                # orig_loc is 1-based local: (0-based_genomic - elt_start) + 1
+                # VCF POS is 1-based; first deleted base in 0-based genomic == vpos,
+                # so its orig_loc = (vpos - elt_start) + 1.
+                # Last deleted base 0-based = vpos + |vlen| - 1,
+                # its orig_loc = vpos + |vlen| - 1 - elt_start + 1 = vpos + |vlen| - elt_start.
+                g_start = (vpos - elt_start) + 1
+                g_end = (vpos + abs(int(vlen))) - elt_start
+
+                left_orig = min(orig_locs, key=lambda x: abs(x - g_start))
+                right_orig = min(orig_locs, key=lambda x: abs(x - g_end))
+
+                cpg_left = coord_to_cpg[left_orig]
+                cpg_right = coord_to_cpg[right_orig]
+
+                if cpg_left > cpg_right:
+                    cpg_left, cpg_right = cpg_right, cpg_left
+
+                del_spans_cpg.append((cpg_left, cpg_right))
+
+    if len(del_spans_cpg) > 1:
+        del_spans_cpg = sorted(del_spans_cpg, key=lambda x: x[0])
+        merged = [del_spans_cpg[0]]
+        for s, e in del_spans_cpg[1:]:
+            ps, pe = merged[-1]
+            if s <= pe + 1:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        del_spans_cpg = merged
+
+    def in_del_span(x):
+        for ds, de in del_spans_cpg:
+            if ds <= x <= de:
+                return True
+        return False
+
+    def is_splitvar_group_sample(sample_name):
+        parts = sample_name.split('.')
+        if len(parts) < 3:
+            return False
+        return parts[-2] == 'alt'
     
-    # llr plot
+       # llr plot
 
     ax4 = plt.subplot(gs[3])
     ax4.set_xticks([])
@@ -4769,7 +4823,7 @@ def locus(args):
     else:
         logger.info('building llr plot... (if this is slow and/or raw signal is not helpful, try --skip_raw_plot)')
 
-        ax4.axhline(y=0, c='#bbbbbb', linestyle='--',lw=1)
+        ax4.axhline(y=0, c='#bbbbbb', linestyle='--', lw=1)
 
         for mod in use_mods:
             upper = 1.0
@@ -4778,15 +4832,26 @@ def locus(args):
             if not methbam:
                 upper, lower = get_cutoffs(list(data.values())[0][0], mod)
 
-            ax4.axhline(y=upper, c='k', linestyle='--',lw=1)
-            ax4.axhline(y=lower, c='k', linestyle='--',lw=1)
+            ax4.axhline(y=upper, c='k', linestyle='--', lw=1)
+            ax4.axhline(y=lower, c='k', linestyle='--', lw=1)
 
-        legend='auto'
-        if args.hidelegend:
-            legend=False
+        for sample in sample_order:
+            sample_df = meth_table[meth_table['sample'] == sample].copy()
+            sample_df = sample_df.sort_values('loc')
 
-        ax4 = sns.lineplot(x='loc', y='modstat', hue='sample', data=meth_table, palette=sample_color, zorder=2, legend=legend)
-        
+            ax4.plot(
+                sample_df['loc'].to_numpy(),
+                sample_df['modstat'].to_numpy(),
+                lw=1.5,
+                color=sample_color[sample],
+                alpha=1.0,
+                zorder=2,
+                label=sample
+            )
+
+        if not args.hidelegend:
+            ax4.legend()
+
         if args.statname:
             ax4.set_ylabel(args.statname)
 
@@ -4801,8 +4866,13 @@ def locus(args):
                     h_e = h_cpg_end[h]
                     h_color = h_colors[h]
                     ymin = min(ax4.get_ybound())
-                    yheight = max(ax4.get_ybound())-ymin
-                    highlight_patches.append(matplotlib.patches.Rectangle([h_s, ymin], h_e-h_s, yheight, edgecolor=None, facecolor=h_color, alpha=a, zorder=1))
+                    yheight = max(ax4.get_ybound()) - ymin
+                    highlight_patches.append(
+                        matplotlib.patches.Rectangle(
+                            [h_s, ymin], h_e - h_s, yheight,
+                            edgecolor=None, facecolor=h_color, alpha=a, zorder=1
+                        )
+                    )
 
         for h in highlight_patches:
             ax4.add_patch(h)
@@ -4835,14 +4905,28 @@ def locus(args):
     for sample in sample_order:
         sample_data = sample_filtered_data[sample]
 
-        windowed_methfrac, meth_n = slide_window(sample_data, sample, width=int(args.slidingwindowsize), slide=int(args.slidingwindowstep))
+        windowed_methfrac, meth_n = slide_window(
+            sample_data,
+            sample,
+            width=int(args.slidingwindowsize),
+            slide=int(args.slidingwindowstep)
+        )
         methfrac_values = np.asarray(list(windowed_methfrac.values()))
 
-        smoothed_methfrac = smooth(methfrac_values, window_len=int(args.smoothwindowsize), window=args.smoothfunc)
+        smoothed_methfrac = smooth(
+            methfrac_values,
+            window_len=int(args.smoothwindowsize),
+            window=args.smoothfunc
+        )
 
         ix = np.asarray(list(windowed_methfrac.keys()))
 
-        for i, smooth_val in enumerate(smoothed_methfrac):
+        smoothed_plot = np.asarray(smoothed_methfrac, dtype=float).copy()
+        if args.splitvar and is_splitvar_group_sample(sample) and len(del_spans_cpg) > 0:
+            del_mask = np.asarray([in_del_span(x) for x in ix], dtype=bool)
+            smoothed_plot[del_mask] = np.nan
+
+        for i, smooth_val in enumerate(smoothed_plot):
             smoothed_values[sample][ix[i]] = smooth_val
 
         masked_segs = mask_methfrac(list(meth_n.values()), cutoff=args.maskcutoff)
@@ -4851,30 +4935,49 @@ def locus(args):
         if len(meth_n) > 0:
             frac_masked = len(list(itertools.chain(*masked_segs))) / len(meth_n.values())
 
-        logger.info('%s:%d-%d (%s), sample %s fraction masked: %.3f' % (chrom, elt_start, elt_end, ''.join(use_mods), sample, frac_masked))
+        logger.info('%s:%d-%d (%s), sample %s fraction masked: %.3f' % (
+            chrom, elt_start, elt_end, ''.join(use_mods), sample, frac_masked
+        ))
 
         if frac_masked > float(args.maxmaskedfrac):
-            logger.warning('%s:%d-%d (%s), skip sample %s due to --maxmaskedfrac %.3f' % (chrom, elt_start, elt_end, ''.join(use_mods), sample, float(args.maxmaskedfrac)))
+            logger.warning('%s:%d-%d (%s), skip sample %s due to --maxmaskedfrac %.3f' % (
+                chrom, elt_start, elt_end, ''.join(use_mods), sample, float(args.maxmaskedfrac)
+            ))
             skipped_samples.append(sample)
             continue
 
         if frac_masked > 0.1 and args.bams is not None and args.ref is None:
             logger.warning('*** WARNING: specifying a reference genome (indexed via samtools faidx) with --restrict_ref is strongly recommended when using mod .bams ***')
 
-        ax5.plot(list(windowed_methfrac.keys()), smoothed_methfrac, marker='', lw=slw, color=sample_color[sample], alpha=smoothalpha, label=sample)
+        ax5.plot(
+            list(windowed_methfrac.keys()),
+            smoothed_plot,
+            marker='',
+            lw=slw,
+            color=sample_color[sample],
+            alpha=smoothalpha,
+            label=sample
+        )
 
         order_stack += 1
 
         if not args.nomask:
             for seg in masked_segs:
                 if len(seg) > 2:
-                    mf_seg = np.asarray(smoothed_methfrac)[seg]
+                    mf_seg = np.asarray(smoothed_plot)[seg]
                     pos_seg = np.asarray(list(windowed_methfrac.keys()))[seg]
-                
-                    ax5.plot(pos_seg, mf_seg, marker='', lw=slw, color='#ffffff', alpha=0.8, zorder=order_stack)
+
+                    ax5.plot(
+                        pos_seg, mf_seg,
+                        marker='',
+                        lw=slw,
+                        color='#ffffff',
+                        alpha=0.8,
+                        zorder=order_stack
+                    )
 
                     order_stack += 1
-
+    
     smoothed_df = pd.DataFrame(smoothed_values)
 
     if not args.include_raw_plot:
