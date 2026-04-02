@@ -97,6 +97,12 @@ class Read:
         self.starts = []
         self.ends   = []
 
+        # nucleosome and MSP tag data (ns/nl and as/al BAM tags)
+        self.nuc_starts  = []
+        self.nuc_lengths = []
+        self.msp_starts  = []
+        self.msp_lengths = []
+
         self.add_mod(cpg_loc, stat, methcall, modname)
 
     def add_mod(self, cpg_loc, stat, methcall, modname, warn=True):
@@ -574,11 +580,10 @@ def get_phased_reads(fn, chrom, start, end, min_mapq=10, retry=5, tag_untagged=F
     return reads
 
 
-def get_variant_reads(fn, chrom, start, end, variants, min_mapq=10, primary_only=False):
+def get_variant_reads(fn, chrom, start, end, variants, dist_tolerance, size_tolerance, min_mapq=10, primary_only=False):
     reads = {}
 
     assert len(variants) == 1
-
     bam = pysam.AlignmentFile(fn)
     for read in bam.fetch(chrom, start, end):
         if read.seq is None:
@@ -591,12 +596,12 @@ def get_variant_reads(fn, chrom, start, end, variants, min_mapq=10, primary_only
         if read.mapq >= min_mapq:    
             allele = None
 
-            alt_sites = check_variants(variants, read, allele='alt')
+            alt_sites = check_variants(variants, read, dist_tolerance, size_tolerance, allele='alt')[0]
             if len(alt_sites) > 0:
                 allele = 'alt'
 
             else:
-                ref_sites = check_variants(variants, read, allele='ref')
+                ref_sites = check_variants(variants, read, dist_tolerance, size_tolerance, allele='ref')[0]
                 if len(ref_sites) > 0:
                     allele = 'ref'
 
@@ -605,35 +610,50 @@ def get_variant_reads(fn, chrom, start, end, variants, min_mapq=10, primary_only
     return reads
 
 
-def check_variants(variants, read, allele=None):
-    sites = []
-
+def check_variants(variants, read, dist_tolerance, size_tolerance, allele=None):
+    variant_sites = []
+    variant_types = []
+    variant_lengths = []
     assert allele in ('ref', 'alt')
     
     for q, r in read.get_aligned_pairs():
-        if q is not None and r in variants:
-            vref, valt, vartype, varlen = variants[r]
+        if r is not None:
+            if r+1 in variants:
+                vref, valt, vartype, varlen = variants[r+1]
 
-            if vartype == 'SNV':
-                if allele == 'alt':
-                    if read.seq[q].upper() == valt.upper():
-                        sites.append(r)
+                if vartype == 'SNV':
+                    if allele == 'alt':
+                        if read.seq[q].upper() == valt.upper():
+                            variant_sites.append(r+1)
+                            variant_types.append(vartype)
+                            variant_lengths.append(varlen)
 
-                if allele == 'ref':
-                    if read.seq[q].upper() == vref.upper():
-                        sites.append(r)
-            
-            elif vartype in ('INS', 'DEL'):
-                sv_gt = has_sv(read, r, variants[r])
+                    if allele == 'ref':
+                        if read.seq[q].upper() == vref.upper():
+                            variant_sites.append(r+1)
+                            variant_types.append(vartype)
+                            variant_lengths.append(varlen)
 
-                if allele == sv_gt:
-                    sites.append(r)
+                
+                elif vartype in ('INS', 'DEL'):
+                    sv_gt = has_sv(read, r+1, variants[r+1], dist_tolerance, size_tolerance)
 
-    return sites
+                    if allele == sv_gt:
+                        variant_sites.append(r+1)
+                        variant_types.append(vartype)
+                        variant_lengths.append(varlen)
+
+    return (variant_sites,variant_types, variant_lengths)
 
 
-def has_sv(read, bnd, variant, window=100):
+import logging
+
+logger = logging.getLogger(__name__)
+
+def has_sv(read, bnd, variant, dist_tolerance, size_tolerance):
+
     if read.seq is None:
+        logger.debug(f"{read.query_name}: skipping read with no sequence")
         return None
 
     svtype = variant[2]
@@ -641,76 +661,55 @@ def has_sv(read, bnd, variant, window=100):
 
     assert svtype in ('DEL', 'INS')
 
-    ap = {}
+    ref_pos = read.reference_start
 
-    ap = dict(read.get_aligned_pairs())
+    for op, length in read.cigartuples:
+        # stop scanning once we're past breakpoint window
+        if ref_pos > (bnd + dist_tolerance):
+            break
+        # MATCH
+        if op == 0:
+            ref_pos += length
 
-    best_rpos = None
-    best_gpos = None
+        # INSERTION
+        elif op == 1:
 
-    for rpos, gpos in ap.items():
-        if gpos is None:
-            continue
+            if svtype == 'INS':
+                distance_to_bnd = abs(bnd - ref_pos)
+                if distance_to_bnd <= dist_tolerance:
+                    size_diff = abs(svlen - length)
+                    if svlen > 0:
+                        size_diff /= svlen
+                    if size_diff <= size_tolerance:
+                        logger.debug(
+                            f"{read.query_name}: matching insertion length={length} pos={ref_pos}"
+                        )
+                        return 'alt'
+        # DELETION
+        elif op == 2:
+            if svtype == 'DEL':
+                distance_to_bnd = abs(bnd - ref_pos)
+                if distance_to_bnd <= dist_tolerance:
+                    size_diff = abs(svlen - length)
+                    if svlen > 0:
+                        size_diff /= svlen
+                    if size_diff <= size_tolerance:
+                        logger.debug(
+                            f"{read.query_name}: matching deletion length={length} pos={ref_pos}"
+                        )
+                        return 'alt'
+            ref_pos += length
 
-        if best_gpos is None:
-            best_gpos = gpos
-            best_rpos = rpos
-
+        # SOFT CLIP
+        elif op == 4:
+            pass
+        # HARD CLIP
+        elif op == 5:
+            pass
+        # OTHER
         else:
-            if abs(bnd-gpos) < abs(bnd-best_gpos):
-                best_gpos = gpos
-                best_rpos = rpos
-
-    if best_rpos < window:
-        return None
-
-    if len(read.seq)-best_rpos < window:
-        return None
-
-    bnd_right = 0
-    bnd_left = 0
-    prev_rp = 0
-
-    for rp in range(best_rpos-1, best_rpos+window):
-        if rp in ap:
-            if ap[rp] is None:
-                bnd_right += 1
-            elif None not in (ap[rp], ap[prev_rp]) and abs(abs(ap[rp]-ap[prev_rp]) - svlen) < window:
-                bnd_right += svlen
-            if ap[rp] is not None:
-                prev_rp = rp
-
-    prev_rp = 0
-
-    for rp in range(best_rpos-window, best_rpos+1):
-        if rp in ap:
-            if ap[rp] is None:
-                bnd_left += 1
-            elif None not in (ap[rp], ap[prev_rp]) and abs(abs(ap[rp]-ap[prev_rp]) - svlen) < window:
-                bnd_left += svlen
-            if ap[rp] is not None:
-                prev_rp = rp
-
-    if svtype == 'INS' and max(bnd_left, bnd_right)*1.25 > window:
-        return 'alt'
-
-    if svtype == 'DEL' and max(bnd_left, bnd_right)*1.25 > svlen:
-        return 'alt'
-    
+            ref_pos += length
     return 'ref'
-
-
-def single_seq_fa(fn):
-    with open(fn, 'r') as fa:
-        seq   = ''
-        for line in fa:
-            if line.startswith('>'):
-                assert seq == '', 'input fa must have only one entry'
-            else:
-                seq = seq + line.strip()
-
-    return seq
-
 
 def rc(dna):
     ''' reverse complement '''
@@ -1025,7 +1024,6 @@ def sample_bam(bam_fn, motif, ref, n, infer_implicit):
         break
 
     return np.asarray(sample)
-
 
 def parse_methbam(
     bam_fn,
@@ -1598,7 +1596,7 @@ def get_meth_locus(args, bam, meth_dbs, mod, infer_implicit, meth_thresh=0.8, ca
         reads = [r for r in reads if r in phased_reads_dict and phased_reads_dict[r] == phase]
 
     if variant:
-        var_reads_dict = get_variant_reads(bam, chrom, elt_start, elt_end, variant, min_mapq=int(args.min_mapq))
+        var_reads_dict = get_variant_reads(bam, chrom, elt_start, elt_end, variant, args.dist_tolerance, args.size_tolerance, min_mapq=int(args.min_mapq))
         reads = [r for r in reads if r in var_reads_dict and var_reads_dict[r] == allele]
 
     if hasattr(args, 'unambig_highlight') and hasattr(args, 'highlight'): 
@@ -3732,7 +3730,7 @@ def locus(args):
         with open(args.variants) as _:
             for rec in var_tbx.fetch(chrom, elt_start, elt_end):
                 vchrom, vpos, vid, vref, valt, vqual, vfilt, vinfo = rec.strip().split()[:8]
-                vpos = int(vpos)-1  # VCF is 1-based, BAM is 0-based
+                vpos = int(vpos)  # VCF is 1-based, BAM is 0-based
 
                 if vfilt not in ('PASS', '.'):
                     continue
@@ -3753,8 +3751,17 @@ def locus(args):
                         i = info_field.split('=')
                         if i[0] == 'SVTYPE':
                             vtype = i[1]
+                        # if type isn't made explicit then infer it
+                        elif (len(vref)>len(valt)):
+                            vtype = 'DEL'
+                        elif (len(vref)<len(valt)):
+                            vtype = 'INS'
                         if i[0] == 'SVLEN':
                             vlen = int(i[1])
+                        # do same for SVLEN
+                        elif(vtype in ('INS','DEL')):
+                            vlen = abs(len(vref) - len(valt))
+
 
                 if split_vid:
                     if split_vid == vid:
@@ -3917,7 +3924,7 @@ def locus(args):
 
     if args.splitvar:
         for bam in data:
-            phased_reads = get_variant_reads(bam, chrom, elt_start, elt_end, variants, min_mapq=int(args.min_mapq), primary_only=args.primary_only)
+            phased_reads = get_variant_reads(bam, chrom, elt_start, elt_end, variants, args.dist_tolerance, args.size_tolerance, min_mapq=int(args.min_mapq), primary_only=args.primary_only)
             phases[bam] = list(set([p for p in phased_reads.values() if p]))
             logger.info('splitvar phases for bam %s: %s' % (bam, ','.join(phases[bam])))
 
@@ -4210,7 +4217,13 @@ def locus(args):
             readmask.append(list(map(int, ivl.split('-'))))
 
     # set up plot
+    tag_track = args.plot_nuc or args.plot_msp
+    tt_offset = 1 if tag_track else 0
+
     p_ratios=[1,5,1,3,3]
+    if tag_track:
+        p_ratios.insert(1, 5)  # insert tag_track panel between gene track and reads (same ratio as reads panel so row heights match)
+
     if args.plot_coverage:
         p_ratios.append(3)
 
@@ -4218,10 +4231,10 @@ def locus(args):
         p_ratios.append(3)
 
     if args.skip_align_plot:
-        p_ratios[1] = 0
-    
+        p_ratios[1 + tt_offset] = 0
+
     if not args.include_raw_plot:
-        p_ratios[3] = 0
+        p_ratios[3 + tt_offset] = 0
 
     fig = plt.figure()
     gs = gridspec.GridSpec(len(p_ratios),1,height_ratios=p_ratios, hspace=0)
@@ -4246,7 +4259,7 @@ def locus(args):
         p_ratios = user_p_ratios
 
         if not args.include_raw_plot:
-            p_ratios[3] = 0
+            p_ratios[3 + tt_offset] = 0
 
         gs = gridspec.GridSpec(len(p_ratios),1,height_ratios=p_ratios, hspace=0)
 
@@ -4443,7 +4456,14 @@ def locus(args):
 
     # per-read plot
 
-    ax1 = plt.subplot(gs[1])
+    if tag_track:
+        ax_tag = plt.subplot(gs[1])
+        ax_tag.set_xticks([])
+        ax_tag.set_yticks([])
+        ax_tag.set_frame_on(False)
+        ax_tag.set_xlim(0, elt_end - elt_start)
+
+    ax1 = plt.subplot(gs[1 + tt_offset])
     ax1.set_xticks([])
     ax1.set_yticks([])
     ax1.set_frame_on(False)
@@ -4454,6 +4474,7 @@ def locus(args):
         readstack = dd(list)
         varcache = {}
         pos_cache = {}
+        tag_cache = {}
         masked_count = 0
 
         # Process all BAM files first to collect position and variant data
@@ -4512,8 +4533,23 @@ def locus(args):
 
                 # Process variants if needed
                 if args.variants and read.query_name not in varcache:
-                    varcache[read.query_name] = check_variants(variants, read, allele='alt')
-            
+                    varcache[read.query_name] = check_variants(variants, read, args.dist_tolerance, args.size_tolerance, allele='alt')
+
+                # Extract nucleosome (ns/nl) and MSP (as/al) tags
+                if tag_track and read.query_name not in tag_cache:
+                    nuc_s, nuc_l, msp_s, msp_l = [], [], [], []
+                    try:
+                        nuc_s = list(read.get_tag('ns'))
+                        nuc_l = list(read.get_tag('nl'))
+                    except KeyError:
+                        pass
+                    try:
+                        msp_s = list(read.get_tag('as'))
+                        msp_l = list(read.get_tag('al'))
+                    except KeyError:
+                        pass
+                    tag_cache[read.query_name] = (read.reference_start, nuc_s, nuc_l, msp_s, msp_l)
+
             fetch_reads_bam.close()
 
         # Build readstack with position data
@@ -4575,6 +4611,63 @@ def locus(args):
 
         ax1.set_ylim(0, pack_y+1)
 
+        if tag_track:
+            nuc_color   = '#9b59b6'  # purple
+            msp_color   = '#e87c2e'  # orange
+            rect_height = 0.65       # consistent whitespace (~0.175 gap each side per row)
+            plot_width  = elt_end - elt_start
+
+            for bamname in reads:
+                for readname, read in reads[bamname].items():
+                    if readname not in tag_cache or read.ypos is None:
+                        continue
+                    ref_start, nuc_s, nuc_l, msp_s, msp_l = tag_cache[readname]
+                    ypos = read.ypos
+                    y0   = ypos - rect_height / 2
+
+                    # phase/splitvar background shading across full read extent
+                    if (args.phased or args.splitvar) and read.starts and read.ends:
+                        bg_x0 = max(min(read.starts) - elt_start, 0)
+                        bg_x1 = min(max(read.ends)   - elt_start, plot_width)
+                        ax_tag.add_patch(matplotlib.patches.Rectangle(
+                            (bg_x0, y0), bg_x1 - bg_x0, rect_height,
+                            facecolor=sample_color[bamname], edgecolor='none', alpha=0.2, zorder=1))
+
+                    # ns/nl: nucleosome positions are relative to read reference_start
+                    if args.plot_nuc:
+                        for s, l in zip(nuc_s, nuc_l):
+                            x = ref_start + s - elt_start
+                            if x + l < 0 or x > plot_width:
+                                continue
+                            ax_tag.add_patch(matplotlib.patches.Rectangle(
+                                (x, y0), l, rect_height,
+                                facecolor=nuc_color, edgecolor='none', alpha=0.7, zorder=2))
+                            # black vertical lines at left and right edges to demarcate boundaries
+                            ax_tag.add_line(matplotlib.lines.Line2D(
+                                [x, x], [y0, y0 + rect_height],
+                                color='black', lw=0.8, zorder=3))
+                            ax_tag.add_line(matplotlib.lines.Line2D(
+                                [x + l, x + l], [y0, y0 + rect_height],
+                                color='black', lw=0.8, zorder=3))
+
+                    # as/al: MSP positions are relative to read reference_start
+                    if args.plot_msp:
+                        for s, l in zip(msp_s, msp_l):
+                            x = ref_start + s - elt_start
+                            if x + l < 0 or x > plot_width:
+                                continue
+                            ax_tag.add_patch(matplotlib.patches.Rectangle(
+                                (x, y0), l, rect_height,
+                                facecolor=msp_color, edgecolor='none', alpha=0.7, zorder=2))
+
+            ax_tag.set_ylim(0, pack_y + 1)
+            legend_handles = []
+            if args.plot_nuc:
+                legend_handles.append(matplotlib.patches.Patch(facecolor=nuc_color, label='Nucleosome'))
+            if args.plot_msp:
+                legend_handles.append(matplotlib.patches.Patch(facecolor=msp_color, label='MSP'))
+            ax_tag.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.8)
+
         bam_ylims = {}
         bam_xlims = {}
 
@@ -4612,8 +4705,9 @@ def locus(args):
                 
                 # Collect variant markers
                 if args.variants and read.read_name in varcache:
-                    for alt_site in varcache[read.read_name]:
-                        variant_markers.append((alt_site-elt_start, read.ypos, var_colours[alt_site]))
+                    alt_sites, alt_types, alt_lengths = varcache[read.read_name]
+                    for alt_site, alt_type, alt_length in zip(alt_sites, alt_types, alt_lengths):
+                        variant_markers.append((alt_site-elt_start, alt_length, alt_type, read.ypos, var_colours[alt_site]))
             
             # Plot in batches for this sample
             if unmeth_markers:
@@ -4629,9 +4723,16 @@ def locus(args):
                 ax1.add_line(matplotlib.lines.Line2D([x1, x2], [y1, y2], lw=lw, zorder=2, color=sample_color[bamname], alpha=la))
             
             # Plot variant markers for this sample
-            for x, y, color in variant_markers:
-                ax1.plot(x, y, marker='v', fillstyle='full', mec='black', mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
-
+            for start, length, vartype, ypos, color in variant_markers:
+                if vartype == 'SNV':
+                    ax1.plot(start,ypos, marker= 'v',fillstyle='full', mec='black', mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
+                if vartype == 'INS':
+                    ax1.plot(start,ypos, marker= 'P',fillstyle='full', mec=color, mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
+                if vartype == 'DEL':
+                     ax1.plot(start,ypos, marker= '|',fillstyle='full', mec=color, mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
+                     ax1.add_line(matplotlib.lines.Line2D([start, (start+length)], [ypos, ypos], lw=lw, zorder=4, color=color, alpha=1))
+                     ax1.plot((start+length), ypos, marker= '|',fillstyle='full', mec=color, mfc=color, markersize=int(args.variantsize), zorder=4, alpha=1)
+                     
             bam_ylims[bamname] = [min([r[0][1] for r in read_lines]), max([r[0][1] for r in read_lines])]
             bam_xlims[bamname] = [min([r[1][0] for r in read_lines]), max([r[1][0] for r in read_lines])]
         
@@ -4672,7 +4773,7 @@ def locus(args):
     # plot correspondence between genome space and cpg space
 
     logger.info('building mod-space plot...')
-    ax2 = plt.subplot(gs[2])
+    ax2 = plt.subplot(gs[2 + tt_offset])
     ax3 = ax2.twiny()
 
     ax2.set_ylim(0,10)
@@ -4721,6 +4822,8 @@ def locus(args):
 
     ax0.set_xlim(ax3.get_xlim()) # sync axes between orig coords and gtf plot
     ax1.set_xlim(ax3.get_xlim())
+    if tag_track:
+        ax_tag.set_xlim(ax3.get_xlim())
     ax2.set_xticks([])
     ax3.set_xticks([])
 
@@ -4746,10 +4849,64 @@ def locus(args):
         ax0.set_xticklabels(xt_labels, rotation=45)
     else:
         ax0.set_xticklabels(xt_labels)
-    
-    # llr plot
+        # deletion spans in mod-space (for breaking lines)
+    del_spans_cpg = []
 
-    ax4 = plt.subplot(gs[3])
+    if args.splitvar and args.variants and len(variants) > 0:
+        orig_locs = sorted(set(meth_table['orig_loc']))
+
+        if len(orig_locs) > 0:
+            for vpos, (vref, valt, vtype, vlen) in variants.items():
+                if vtype != 'DEL':
+                    continue
+                if vlen is None:
+                    continue
+
+                # orig_loc is 1-based local: (0-based_genomic - elt_start) + 1
+                # VCF POS is 1-based; first deleted base in 0-based genomic == vpos,
+                # so its orig_loc = (vpos - elt_start) + 1.
+                # Last deleted base 0-based = vpos + |vlen| - 1,
+                # its orig_loc = vpos + |vlen| - 1 - elt_start + 1 = vpos + |vlen| - elt_start.
+                g_start = (vpos - elt_start) + 1
+                g_end = (vpos + abs(int(vlen))) - elt_start
+
+                left_orig = min(orig_locs, key=lambda x: abs(x - g_start))
+                right_orig = min(orig_locs, key=lambda x: abs(x - g_end))
+
+                cpg_left = coord_to_cpg[left_orig]
+                cpg_right = coord_to_cpg[right_orig]
+
+                if cpg_left > cpg_right:
+                    cpg_left, cpg_right = cpg_right, cpg_left
+
+                del_spans_cpg.append((cpg_left, cpg_right))
+
+    if len(del_spans_cpg) > 1:
+        del_spans_cpg = sorted(del_spans_cpg, key=lambda x: x[0])
+        merged = [del_spans_cpg[0]]
+        for s, e in del_spans_cpg[1:]:
+            ps, pe = merged[-1]
+            if s <= pe + 1:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        del_spans_cpg = merged
+
+    def in_del_span(x):
+        for ds, de in del_spans_cpg:
+            if ds <= x <= de:
+                return True
+        return False
+
+    def is_splitvar_group_sample(sample_name):
+        parts = sample_name.split('.')
+        if len(parts) < 3:
+            return False
+        return parts[-2] == 'alt'
+    
+       # llr plot
+
+    ax4 = plt.subplot(gs[3 + tt_offset])
     ax4.set_xticks([])
     ax4.yaxis.tick_right()
 
@@ -4759,7 +4916,7 @@ def locus(args):
     else:
         logger.info('building llr plot... (if this is slow and/or raw signal is not helpful, try --skip_raw_plot)')
 
-        ax4.axhline(y=0, c='#bbbbbb', linestyle='--',lw=1)
+        ax4.axhline(y=0, c='#bbbbbb', linestyle='--', lw=1)
 
         for mod in use_mods:
             upper = 1.0
@@ -4768,15 +4925,26 @@ def locus(args):
             if not methbam:
                 upper, lower = get_cutoffs(list(data.values())[0][0], mod)
 
-            ax4.axhline(y=upper, c='k', linestyle='--',lw=1)
-            ax4.axhline(y=lower, c='k', linestyle='--',lw=1)
+            ax4.axhline(y=upper, c='k', linestyle='--', lw=1)
+            ax4.axhline(y=lower, c='k', linestyle='--', lw=1)
 
-        legend='auto'
-        if args.hidelegend:
-            legend=False
+        for sample in sample_order:
+            sample_df = meth_table[meth_table['sample'] == sample].copy()
+            sample_df = sample_df.sort_values('loc')
 
-        ax4 = sns.lineplot(x='loc', y='modstat', hue='sample', data=meth_table, palette=sample_color, zorder=2, legend=legend)
-        
+            ax4.plot(
+                sample_df['loc'].to_numpy(),
+                sample_df['modstat'].to_numpy(),
+                lw=1.5,
+                color=sample_color[sample],
+                alpha=1.0,
+                zorder=2,
+                label=sample
+            )
+
+        if not args.hidelegend:
+            ax4.legend()
+
         if args.statname:
             ax4.set_ylabel(args.statname)
 
@@ -4791,8 +4959,13 @@ def locus(args):
                     h_e = h_cpg_end[h]
                     h_color = h_colors[h]
                     ymin = min(ax4.get_ybound())
-                    yheight = max(ax4.get_ybound())-ymin
-                    highlight_patches.append(matplotlib.patches.Rectangle([h_s, ymin], h_e-h_s, yheight, edgecolor=None, facecolor=h_color, alpha=a, zorder=1))
+                    yheight = max(ax4.get_ybound()) - ymin
+                    highlight_patches.append(
+                        matplotlib.patches.Rectangle(
+                            [h_s, ymin], h_e - h_s, yheight,
+                            edgecolor=None, facecolor=h_color, alpha=a, zorder=1
+                        )
+                    )
 
         for h in highlight_patches:
             ax4.add_patch(h)
@@ -4800,7 +4973,7 @@ def locus(args):
     # meth frac plot
 
     logger.info('building meth frac plot...')
-    ax5 = plt.subplot(gs[4])
+    ax5 = plt.subplot(gs[4 + tt_offset])
 
     order_stack = 2
 
@@ -4825,14 +4998,28 @@ def locus(args):
     for sample in sample_order:
         sample_data = sample_filtered_data[sample]
 
-        windowed_methfrac, meth_n = slide_window(sample_data, sample, width=int(args.slidingwindowsize), slide=int(args.slidingwindowstep))
+        windowed_methfrac, meth_n = slide_window(
+            sample_data,
+            sample,
+            width=int(args.slidingwindowsize),
+            slide=int(args.slidingwindowstep)
+        )
         methfrac_values = np.asarray(list(windowed_methfrac.values()))
 
-        smoothed_methfrac = smooth(methfrac_values, window_len=int(args.smoothwindowsize), window=args.smoothfunc)
+        smoothed_methfrac = smooth(
+            methfrac_values,
+            window_len=int(args.smoothwindowsize),
+            window=args.smoothfunc
+        )
 
         ix = np.asarray(list(windowed_methfrac.keys()))
 
-        for i, smooth_val in enumerate(smoothed_methfrac):
+        smoothed_plot = np.asarray(smoothed_methfrac, dtype=float).copy()
+        if args.splitvar and is_splitvar_group_sample(sample) and len(del_spans_cpg) > 0:
+            del_mask = np.asarray([in_del_span(x) for x in ix], dtype=bool)
+            smoothed_plot[del_mask] = np.nan
+
+        for i, smooth_val in enumerate(smoothed_plot):
             smoothed_values[sample][ix[i]] = smooth_val
 
         masked_segs = mask_methfrac(list(meth_n.values()), cutoff=args.maskcutoff)
@@ -4841,30 +5028,49 @@ def locus(args):
         if len(meth_n) > 0:
             frac_masked = len(list(itertools.chain(*masked_segs))) / len(meth_n.values())
 
-        logger.info('%s:%d-%d (%s), sample %s fraction masked: %.3f' % (chrom, elt_start, elt_end, ''.join(use_mods), sample, frac_masked))
+        logger.info('%s:%d-%d (%s), sample %s fraction masked: %.3f' % (
+            chrom, elt_start, elt_end, ''.join(use_mods), sample, frac_masked
+        ))
 
         if frac_masked > float(args.maxmaskedfrac):
-            logger.warning('%s:%d-%d (%s), skip sample %s due to --maxmaskedfrac %.3f' % (chrom, elt_start, elt_end, ''.join(use_mods), sample, float(args.maxmaskedfrac)))
+            logger.warning('%s:%d-%d (%s), skip sample %s due to --maxmaskedfrac %.3f' % (
+                chrom, elt_start, elt_end, ''.join(use_mods), sample, float(args.maxmaskedfrac)
+            ))
             skipped_samples.append(sample)
             continue
 
         if frac_masked > 0.1 and args.bams is not None and args.ref is None:
             logger.warning('*** WARNING: specifying a reference genome (indexed via samtools faidx) with --restrict_ref is strongly recommended when using mod .bams ***')
 
-        ax5.plot(list(windowed_methfrac.keys()), smoothed_methfrac, marker='', lw=slw, color=sample_color[sample], alpha=smoothalpha, label=sample)
+        ax5.plot(
+            list(windowed_methfrac.keys()),
+            smoothed_plot,
+            marker='',
+            lw=slw,
+            color=sample_color[sample],
+            alpha=smoothalpha,
+            label=sample
+        )
 
         order_stack += 1
 
         if not args.nomask:
             for seg in masked_segs:
                 if len(seg) > 2:
-                    mf_seg = np.asarray(smoothed_methfrac)[seg]
+                    mf_seg = np.asarray(smoothed_plot)[seg]
                     pos_seg = np.asarray(list(windowed_methfrac.keys()))[seg]
-                
-                    ax5.plot(pos_seg, mf_seg, marker='', lw=slw, color='#ffffff', alpha=0.8, zorder=order_stack)
+
+                    ax5.plot(
+                        pos_seg, mf_seg,
+                        marker='',
+                        lw=slw,
+                        color='#ffffff',
+                        alpha=0.8,
+                        zorder=order_stack
+                    )
 
                     order_stack += 1
-
+    
     smoothed_df = pd.DataFrame(smoothed_values)
 
     if not args.include_raw_plot:
@@ -4939,7 +5145,7 @@ def locus(args):
 
     if args.plot_coverage:
         logger.info('building coverage plot...')
-        ax6 = plt.subplot(gs[5])
+        ax6 = plt.subplot(gs[5 + tt_offset])
 
         for sample in cover_bams:
             offset = list(windowed_methfrac.keys())[0]
@@ -6868,7 +7074,6 @@ def wgmeth(args):
 
 def main():
     logger.info('starting methylartist with command: %s' % ' '.join(sys.argv))
-    logger.info("buthoole")
     args = parse_args()
     args.func(args)
 
@@ -7050,6 +7255,10 @@ def parse_args():
     parser_locus.add_argument('--notext', default=False, action='store_true', help='remove all text from figure')
     parser_locus.add_argument('--svg', action='store_true')
     parser_locus.add_argument('--infer_implicit', action='store_true', default=False, help='If MM tags are marked with an implicitly cannonical base code (i.e ".") then these will be interpreted as a zero probability')
+    parser_locus.add_argument('--dist_tolerance', default=50, help='number of allowed basepairs away from a labeled variant position (in vcf) to count as a particular variant')
+    parser_locus.add_argument('--size_tolerance', default=0.2, help='allowed percentage difference in size to be considered the same as a variant in a vcf file')
+    parser_locus.add_argument('--plot_nuc', default=False, action='store_true', help='plot nucleosomes (ns/nl BAM tags) as purple rectangles in a panel above the read alignment plot')
+    parser_locus.add_argument('--plot_msp', default=False, action='store_true', help='plot methylation-sensitive patches (as/al BAM tags) as orange rectangles in a panel above the read alignment plot')
 
     # options for region plots
     parser_region.add_argument('-i', '--interval', required=True, help='chrom:start-end')
