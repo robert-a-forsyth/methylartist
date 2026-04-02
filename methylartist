@@ -4220,9 +4220,16 @@ def locus(args):
     tag_track = args.plot_nuc or args.plot_msp
     tt_offset = 1 if tag_track else 0
 
+    nd_track     = args.plot_nuc_density and args.plot_nuc  # density only meaningful with nuc track
+    nd_offset    = 1 if nd_track else 0
+    panel_offset = tt_offset + nd_offset  # total offset for all panels below tag/density pair
+
     p_ratios=[1,5,1,3,3]
     if tag_track:
         p_ratios.insert(1, 5)  # insert tag_track panel between gene track and reads (same ratio as reads panel so row heights match)
+
+    if nd_track:
+        p_ratios.insert(2, 3)  # insert nucleosome density panel directly after tag track
 
     if args.plot_coverage:
         p_ratios.append(3)
@@ -4231,10 +4238,10 @@ def locus(args):
         p_ratios.append(3)
 
     if args.skip_align_plot:
-        p_ratios[1 + tt_offset] = 0
+        p_ratios[1 + panel_offset] = 0
 
     if not args.include_raw_plot:
-        p_ratios[3 + tt_offset] = 0
+        p_ratios[3 + panel_offset] = 0
 
     fig = plt.figure()
     gs = gridspec.GridSpec(len(p_ratios),1,height_ratios=p_ratios, hspace=0)
@@ -4247,6 +4254,8 @@ def locus(args):
 
     if args.height:
         img_h = float(args.height)
+    elif nd_track:
+        img_h += 2  # expand figure to cleanly fit density panel
 
     fig.set_size_inches(img_w, img_h)
 
@@ -4259,7 +4268,7 @@ def locus(args):
         p_ratios = user_p_ratios
 
         if not args.include_raw_plot:
-            p_ratios[3 + tt_offset] = 0
+            p_ratios[3 + panel_offset] = 0
 
         gs = gridspec.GridSpec(len(p_ratios),1,height_ratios=p_ratios, hspace=0)
 
@@ -4463,7 +4472,10 @@ def locus(args):
         ax_tag.set_frame_on(False)
         ax_tag.set_xlim(0, elt_end - elt_start)
 
-    ax1 = plt.subplot(gs[1 + tt_offset])
+    if nd_track:
+        ax_nd = plt.subplot(gs[2])
+
+    ax1 = plt.subplot(gs[1 + panel_offset])
     ax1.set_xticks([])
     ax1.set_yticks([])
     ax1.set_frame_on(False)
@@ -4639,16 +4651,21 @@ def locus(args):
                             x = ref_start + s - elt_start
                             if x + l < 0 or x > plot_width:
                                 continue
+                            x_draw = max(0, x)
+                            l_draw = min(x + l, plot_width) - x_draw
                             ax_tag.add_patch(matplotlib.patches.Rectangle(
-                                (x, y0), l, rect_height,
+                                (x_draw, y0), l_draw, rect_height,
                                 facecolor=nuc_color, edgecolor='none', alpha=0.7, zorder=2))
                             # black vertical lines at left and right edges to demarcate boundaries
-                            ax_tag.add_line(matplotlib.lines.Line2D(
-                                [x, x], [y0, y0 + rect_height],
-                                color='black', lw=0.8, zorder=3))
-                            ax_tag.add_line(matplotlib.lines.Line2D(
-                                [x + l, x + l], [y0, y0 + rect_height],
-                                color='black', lw=0.8, zorder=3))
+                            # only drawn when the boundary falls within the plot
+                            if x >= 0:
+                                ax_tag.add_line(matplotlib.lines.Line2D(
+                                    [x, x], [y0, y0 + rect_height],
+                                    color='black', lw=0.8, zorder=3))
+                            if x + l <= plot_width:
+                                ax_tag.add_line(matplotlib.lines.Line2D(
+                                    [x + l, x + l], [y0, y0 + rect_height],
+                                    color='black', lw=0.8, zorder=3))
 
                     # as/al: MSP positions are relative to read reference_start
                     if args.plot_msp:
@@ -4667,6 +4684,43 @@ def locus(args):
             if args.plot_msp:
                 legend_handles.append(matplotlib.patches.Patch(facecolor=msp_color, label='MSP'))
             ax_tag.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.8)
+
+        if nd_track:
+            logger.info('building nucleosome density plot...')
+
+            plot_width_int = elt_end - elt_start
+
+            for bamname in reads:
+                density = np.zeros(plot_width_int, dtype=float)
+                n_reads = 0
+                for readname, read in reads[bamname].items():
+                    if readname not in tag_cache or read.ypos is None:
+                        continue
+                    n_reads += 1
+                    ref_start, nuc_s, nuc_l, _, _ = tag_cache[readname]
+                    for s, l in zip(nuc_s, nuc_l):
+                        x  = ref_start + s - elt_start
+                        x0 = max(0, x)
+                        x1 = min(plot_width_int, x + l)
+                        if x1 > x0:
+                            density[x0:x1] += 1.0
+                if n_reads > 0:
+                    density /= n_reads
+                logger.info('nucleosome density: bamname=%s n_reads=%d max_density=%.3f' % (bamname, n_reads, density.max()))
+
+                x_offsets = np.arange(plot_width_int)  # 0-based offset coords, same system as ax_tag
+                ax_nd.fill_between(x_offsets, density, alpha=0.3, color=sample_color[bamname])
+                ax_nd.plot(x_offsets, density, lw=1.0, color=sample_color[bamname], label=bamname)
+
+            ax_nd.set_xlim(0, plot_width_int)
+            ax_nd.set_ylim(0, 1.05)
+            ax_nd.set_ylabel('Nuc.\noccupancy', fontsize=8, labelpad=2)
+            ax_nd.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(0.5))
+            ax_nd.tick_params(axis='x', labelbottom=False)
+            ax_nd.spines['top'].set_visible(False)
+            ax_nd.spines['right'].set_visible(False)
+            if not args.hidelegend:
+                ax_nd.legend(loc='upper right', fontsize=6, framealpha=0.8)
 
         bam_ylims = {}
         bam_xlims = {}
@@ -4773,7 +4827,7 @@ def locus(args):
     # plot correspondence between genome space and cpg space
 
     logger.info('building mod-space plot...')
-    ax2 = plt.subplot(gs[2 + tt_offset])
+    ax2 = plt.subplot(gs[2 + panel_offset])
     ax3 = ax2.twiny()
 
     ax2.set_ylim(0,10)
@@ -4824,6 +4878,8 @@ def locus(args):
     ax1.set_xlim(ax3.get_xlim())
     if tag_track:
         ax_tag.set_xlim(ax3.get_xlim())
+    if nd_track:
+        ax_nd.set_xlim(ax3.get_xlim())
     ax2.set_xticks([])
     ax3.set_xticks([])
 
@@ -4906,7 +4962,7 @@ def locus(args):
     
        # llr plot
 
-    ax4 = plt.subplot(gs[3 + tt_offset])
+    ax4 = plt.subplot(gs[3 + panel_offset])
     ax4.set_xticks([])
     ax4.yaxis.tick_right()
 
@@ -4973,7 +5029,7 @@ def locus(args):
     # meth frac plot
 
     logger.info('building meth frac plot...')
-    ax5 = plt.subplot(gs[4 + tt_offset])
+    ax5 = plt.subplot(gs[4 + panel_offset])
 
     order_stack = 2
 
@@ -5145,7 +5201,7 @@ def locus(args):
 
     if args.plot_coverage:
         logger.info('building coverage plot...')
-        ax6 = plt.subplot(gs[5 + tt_offset])
+        ax6 = plt.subplot(gs[5 + panel_offset])
 
         for sample in cover_bams:
             offset = list(windowed_methfrac.keys())[0]
@@ -7259,6 +7315,7 @@ def parse_args():
     parser_locus.add_argument('--size_tolerance', default=0.2, help='allowed percentage difference in size to be considered the same as a variant in a vcf file')
     parser_locus.add_argument('--plot_nuc', default=False, action='store_true', help='plot nucleosomes (ns/nl BAM tags) as purple rectangles in a panel above the read alignment plot')
     parser_locus.add_argument('--plot_msp', default=False, action='store_true', help='plot methylation-sensitive patches (as/al BAM tags) as orange rectangles in a panel above the read alignment plot')
+    parser_locus.add_argument('--plot_nuc_density', default=False, action='store_true', help='plot nucleosome occupancy density (fraction of reads with a nucleosome spanning each base) in a panel below the nucleosome track (requires --plot_nuc)')
 
     # options for region plots
     parser_region.add_argument('-i', '--interval', required=True, help='chrom:start-end')
